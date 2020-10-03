@@ -12,6 +12,14 @@ sys.path.append('utils')
 from proj_adaptive_softmax import ProjectedAdaptiveLogSoftmax
 from log_uniform_sampler import LogUniformSampler, sample_logits
 
+
+def logging(s, log_path = "./t_log.txt", print_=True, log_=True):
+    if print_:
+        print(s)
+        if log_:
+            with open(log_path, 'a+') as f_log:
+                f_log.write(s + '\n')
+
 class PositionalEmbedding(nn.Module):
     def __init__(self, demb):
         super(PositionalEmbedding, self).__init__()
@@ -114,9 +122,9 @@ class MultiHeadAttn(nn.Module):
         attn_score.mul_(self.scale)
         if attn_mask is not None and attn_mask.any().item():
             if attn_mask.dim() == 2:
-                attn_score.masked_fill_(attn_mask[None,:,:,None], -float('inf'))
+                attn_score.masked_fill_(attn_mask[None,:,:,None], -float(1e9))
             elif attn_mask.dim() == 3:
-                attn_score.masked_fill_(attn_mask[:,:,:,None], -float('inf'))
+                attn_score.masked_fill_(attn_mask[:,:,:,None], -float(1e9))
 
         # [qlen x klen x bsz x n_head]
         attn_prob = F.softmax(attn_score, dim=1)
@@ -215,7 +223,7 @@ class RelPartialLearnableMultiHeadAttn(RelMultiHeadAttn):
 
         self.r_net = nn.Linear(self.d_model, self.n_head * self.d_head, bias=False)
 
-    def forward(self, w, r, r_w_bias, r_r_bias, attn_mask=None, mems=None):
+    def forward(self, w, r, r_w_bias, r_r_bias, attn_mask=None, mems=None, prune_mask=None):
         qlen, rlen, bsz = w.size(0), r.size(0), w.size(1)
 
         if mems is not None:
@@ -261,10 +269,15 @@ class RelPartialLearnableMultiHeadAttn(RelMultiHeadAttn):
         if attn_mask is not None and attn_mask.any().item():
             if attn_mask.dim() == 2:
                 attn_score = attn_score.float().masked_fill(
-                    attn_mask[None,:,:,None], -float('inf')).type_as(attn_score)
+                    attn_mask[None,:,:,None], -float('1e9')).type_as(attn_score)
             elif attn_mask.dim() == 3:
                 attn_score = attn_score.float().masked_fill(
-                    attn_mask[:,:,:,None], -float('inf')).type_as(attn_score)
+                    attn_mask[:,:,:,None], -float('1e9')).type_as(attn_score)
+        # now do pruning mask
+        if prune_mask is not None and prune_mask.any().item():
+            qlen, klen, bsz, n_head = attn_score.shape
+            mask_segment = torch.from_numpy(prune_mask[0:qlen, 0:klen, :, :]).cuda().byte()
+            attn_score = attn_score.float().masked_fill(mask_segment, -float(1e9)).type_as(attn_score)
 
         # [qlen x klen x bsz x n_head]
         attn_prob = F.softmax(attn_score, dim=1)
@@ -347,9 +360,9 @@ class RelLearnableMultiHeadAttn(RelMultiHeadAttn):
         #### compute attention probability
         if attn_mask is not None and attn_mask.any().item():
             if attn_mask.dim() == 2:
-                attn_score.masked_fill_(attn_mask[None,:,:,None], -float('inf'))
+                attn_score.masked_fill_(attn_mask[None,:,:,None], -float(1e9))
             elif attn_mask.dim() == 3:
-                attn_score.masked_fill_(attn_mask[:,:,:,None], -float('inf'))
+                attn_score.masked_fill_(attn_mask[:,:,:,None], -float(1e9))
 
         # [qlen x klen x bsz x n_head]
         attn_prob = F.softmax(attn_score, dim=1)
@@ -383,10 +396,10 @@ class DecoderLayer(nn.Module):
         self.pos_ff = PositionwiseFF(d_model, d_inner, dropout, 
                                      pre_lnorm=kwargs.get('pre_lnorm'))
 
-    def forward(self, dec_inp, dec_attn_mask=None, mems=None):
+    def forward(self, dec_inp, dec_attn_mask=None, mems=None, prune_mask=None):
 
         output = self.dec_attn(dec_inp, attn_mask=dec_attn_mask,
-                               mems=mems)
+                               mems=mems, prune_mask=prune_mask)
         output = self.pos_ff(output)
 
         return output
@@ -401,11 +414,11 @@ class RelLearnableDecoderLayer(nn.Module):
         self.pos_ff = PositionwiseFF(d_model, d_inner, dropout, 
                                      pre_lnorm=kwargs.get('pre_lnorm'))
 
-    def forward(self, dec_inp, r_emb, r_w_bias, r_bias, dec_attn_mask=None, mems=None):
+    def forward(self, dec_inp, r_emb, r_w_bias, r_bias, dec_attn_mask=None, mems=None, prune_mask=None):
 
         output = self.dec_attn(dec_inp, r_emb, r_w_bias, r_bias,
                                attn_mask=dec_attn_mask,
-                               mems=mems)
+                               mems=mems, prune_mask=prune_mask)
         output = self.pos_ff(output)
 
         return output
@@ -420,11 +433,11 @@ class RelPartialLearnableDecoderLayer(nn.Module):
         self.pos_ff = PositionwiseFF(d_model, d_inner, dropout, 
                                      pre_lnorm=kwargs.get('pre_lnorm'))
 
-    def forward(self, dec_inp, r, r_w_bias, r_r_bias, dec_attn_mask=None, mems=None):
+    def forward(self, dec_inp, r, r_w_bias, r_r_bias, dec_attn_mask=None, mems=None, prune_mask=None):
 
         output = self.dec_attn(dec_inp, r, r_w_bias, r_r_bias,
                                attn_mask=dec_attn_mask,
-                               mems=mems)
+                               mems=mems, prune_mask=prune_mask)
         output = self.pos_ff(output)
 
         return output
@@ -499,7 +512,7 @@ class MemTransformerLM(nn.Module):
                  tgt_len=None, ext_len=None, mem_len=None, 
                  cutoffs=[], adapt_inp=False,
                  same_length=False, attn_type=0, clamp_len=-1, 
-                 sample_softmax=-1):
+                 sample_softmax=-1, th=0, fn="attn_scores.npy"):
         super(MemTransformerLM, self).__init__()
         self.n_token = n_token
 
@@ -523,7 +536,10 @@ class MemTransformerLM(nn.Module):
 
         self.attn_type = attn_type
 
+        self.th = th
+
         self.layers = nn.ModuleList()
+
         if attn_type == 0: # the default attention
             for i in range(n_layer):
                 self.layers.append(
@@ -575,6 +591,20 @@ class MemTransformerLM(nn.Module):
 
         self.same_length = same_length
         self.clamp_len = clamp_len
+
+        # load average attention patterns
+        # (n_layer, qlen, klen, 1, n_head)
+        weights = np.load(fn)
+        shape = weights.shape
+        n_layer, n_head =  shape[0], shape[-1]
+        # init prune mask attribute
+        self.prune_masks = np.zeros(weights.shape)
+        target_percentile = target_percentage * 100
+        target_percentage = self.th
+        for i in range(0, n_layer):
+            w = weights[i,:,:,:,:]
+            tau = np.percentile(w, target_percentile, interpolation='nearest')
+            self.prune_masks[i,:,:,:,:] = w  <= tau
 
         self._create_params()
 
@@ -646,6 +676,7 @@ class MemTransformerLM(nn.Module):
 
         mlen = mems[0].size(0) if mems is not None else 0
         klen = mlen + qlen
+
         if self.same_length:
             all_ones = word_emb.new_ones(qlen, klen)
             mask_len = klen - self.mem_len
@@ -673,8 +704,12 @@ class MemTransformerLM(nn.Module):
             hids.append(core_out)
             for i, layer in enumerate(self.layers):
                 mems_i = None if mems is None else mems[i]
-                core_out = layer(core_out, pos_emb, self.r_w_bias,
-                        self.r_r_bias, dec_attn_mask=dec_attn_mask, mems=mems_i)
+                if self.prune_masks is not None:
+                    core_out = layer(core_out, pos_emb, self.r_w_bias,
+                            self.r_r_bias, dec_attn_mask=dec_attn_mask, mems=mems_i, prune_mask=self.prune_masks[i])
+                else:
+                    core_out = layer(core_out, pos_emb, self.r_w_bias,
+                            self.r_r_bias, dec_attn_mask=dec_attn_mask, mems=mems_i)
                 hids.append(core_out)
         elif self.attn_type == 1: # learnable
             core_out = self.drop(word_emb)
@@ -687,8 +722,12 @@ class MemTransformerLM(nn.Module):
                     r_emb, r_bias = self.r_emb[i], self.r_bias[i]
 
                 mems_i = None if mems is None else mems[i]
-                core_out = layer(core_out, r_emb, self.r_w_bias[i],
-                        r_bias, dec_attn_mask=dec_attn_mask, mems=mems_i)
+                if self.prune_masks is not None:
+                    core_out = layer(core_out, r_emb, self.r_w_bias[i],
+                            r_bias, dec_attn_mask=dec_attn_mask, mems=mems_i, prune_mask=self.prune_masks[i])
+                else:
+                    core_out = layer(core_out, r_emb, self.r_w_bias[i],
+                            r_bias, dec_attn_mask=dec_attn_mask, mems=mems_i)
                 hids.append(core_out)
         elif self.attn_type == 2: # absolute
             pos_seq = torch.arange(klen - 1, -1, -1.0, device=word_emb.device,
@@ -704,8 +743,10 @@ class MemTransformerLM(nn.Module):
                 mems_i = None if mems is None else mems[i]
                 if mems_i is not None and i == 0:
                     mems_i += pos_emb[:mlen]
-                core_out = layer(core_out, dec_attn_mask=dec_attn_mask,
-                                 mems=mems_i)
+                if self.prune_masks is not None:
+                    core_out = layer(core_out, dec_attn_mask=dec_attn_mask, mems=mems_i, prune_mask=self.prune_masks[i])
+                else:
+                    core_out = layer(core_out, dec_attn_mask=dec_attn_mask, mems=mems_i)
                 hids.append(core_out)
         elif self.attn_type == 3:
             core_out = self.drop(word_emb)
@@ -723,9 +764,11 @@ class MemTransformerLM(nn.Module):
                         cur_emb = cur_emb[-mlen:]
                     mems_i += cur_emb.view(mlen, 1, -1)
                 core_out += self.r_emb[i][-qlen:].view(qlen, 1, -1)
-
-                core_out = layer(core_out, dec_attn_mask=dec_attn_mask,
-                                 mems=mems_i)
+                if self.prune_masks is not None:
+                    core_out = layer(core_out, dec_attn_mask=dec_attn_mask,
+                                     mems=mems_i, prune_mask=self.prune_masks[i])
+                else:
+                    core_out = layer(core_out, dec_attn_mask=dec_attn_mask, mems=mems_i)
                 hids.append(core_out)
 
         core_out = self.drop(core_out)
@@ -751,6 +794,8 @@ class MemTransformerLM(nn.Module):
                 self.out_layer.bias, target, pred_hid, self.sampler)
             loss = -F.log_softmax(logit, -1)[:, :, 0]
         else:
+            pred_hid = pred_hid.contiguous()
+            target = target.contiguous()
             loss = self.crit(pred_hid.view(-1, pred_hid.size(-1)), target.view(-1))
             loss = loss.view(tgt_len, -1)
 
