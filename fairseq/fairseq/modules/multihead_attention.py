@@ -13,6 +13,7 @@ from torch import Tensor, nn
 from torch.nn import Parameter
 from fairseq.incremental_decoding_utils import with_incremental_state
 
+from entmax import sparsemax, entmax15, entmax_bisect
 
 @with_incremental_state
 class MultiheadAttention(nn.Module):
@@ -33,7 +34,10 @@ class MultiheadAttention(nn.Module):
         add_zero_attn=False,
         self_attention=False,
         encoder_decoder_attention=False,
+        args=None
     ):
+        if args is not None:
+            self.USE_ENTMAX=args.USE_ENTMAX
         super().__init__()
         self.embed_dim = embed_dim
         self.kdim = kdim if kdim is not None else embed_dim
@@ -78,6 +82,7 @@ class MultiheadAttention(nn.Module):
             self.enable_torch_version = True
         else:
             self.enable_torch_version = False
+        self.enable_torch_version = False
 
     def prepare_for_onnx_export_(self):
         self.onnx_trace = True
@@ -114,6 +119,7 @@ class MultiheadAttention(nn.Module):
         attn_mask: Optional[Tensor] = None,
         before_softmax: bool = False,
         need_head_weights: bool = False,
+        prune_attn_mask = None,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         """Input shape: Time x Batch x Channel
 
@@ -131,6 +137,7 @@ class MultiheadAttention(nn.Module):
             need_head_weights (bool, optional): return the attention
                 weights for each head. Implies *need_weights*. Default:
                 return the average attention weights over all heads.
+            prune_attn_mask shape (tensor): has shape(1, self.num_heads, 1024, 1024)
         """
         if need_head_weights:
             need_weights = True
@@ -312,6 +319,15 @@ class MultiheadAttention(nn.Module):
 
         assert list(attn_weights.size()) == [bsz * self.num_heads, tgt_len, src_len]
 
+        if prune_attn_mask is not None:
+            if incremental_state is None: #train
+                prune_attn_mask = prune_attn_mask.to(torch.bool)[:,:,0:tgt_len, 0:src_len]
+            else: #generation
+                prune_attn_mask = prune_attn_mask.to(torch.bool)[:,:,src_len+1:src_len+2, 0:src_len]
+            attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
+            attn_weights = attn_weights.masked_fill(prune_attn_mask, -32768) #prune_mask is 1 where we want to mask
+            attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
+
         if attn_mask is not None:
             attn_mask = attn_mask.unsqueeze(0)
             if self.onnx_trace:
@@ -329,15 +345,18 @@ class MultiheadAttention(nn.Module):
         if before_softmax:
             return attn_weights, v
 
-        attn_weights_float = utils.softmax(
-            attn_weights, dim=-1, onnx_trace=self.onnx_trace
-        )
+        if self.USE_ENTMAX:
+            attn_weights_float = entmax15(attn_weights)
+        else:
+            attn_weights_float = utils.softmax(attn_weights, dim=-1, onnx_trace=self.onnx_trace)
+
         attn_weights = attn_weights_float.type_as(attn_weights)
         attn_probs = F.dropout(
             attn_weights_float.type_as(attn_weights),
             p=self.dropout,
             training=self.training,
         )
+        self.attn_probs = attn_probs.view(bsz, self.num_heads, tgt_len, src_len) #keep track of attention pattern for pruning experiments
         assert v is not None
         attn = torch.bmm(attn_probs, v)
         assert list(attn.size()) == [bsz * self.num_heads, tgt_len, self.head_dim]

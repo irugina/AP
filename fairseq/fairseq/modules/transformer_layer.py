@@ -12,6 +12,46 @@ from fairseq import utils
 from fairseq.modules import LayerNorm, MultiheadAttention
 from torch import Tensor
 
+import numpy as np
+
+def random_mask(attention_pattern, percentage):
+    d1, d2, d3, d4 = attention_pattern.shape
+    d3_bounds, d4_bounds = find_bounds(attention_pattern)
+
+    attn_mask = np.zeros(attention_pattern.shape)
+
+    number_of_ones = int(d1 * d2 * d3_bounds * d4_bounds * percentage)
+    number_of_zeros = d1 * d2 * d3_bounds * d4_bounds - number_of_ones
+
+    flat_mask = np.array([1 for _ in range(number_of_ones)] + [0 for _ in range(number_of_zeros)])
+    np.random.shuffle(flat_mask)
+    flat_mask = flat_mask.reshape(d1, d2, d3_bounds, d4_bounds)
+
+    attn_mask[:,:,0:d3_bounds, 0:d4_bounds] = flat_mask
+    return attn_mask
+
+def find_bounds(arr):
+    """
+    arr: attention pattern
+    return: end-points of non-zero block
+    """
+    flatten = np.sum(arr, axis = (0,1))
+    zero_flatten = flatten != 0
+    d1, d2 = zero_flatten.shape
+
+    d1_bound = 0
+    for i in range(0, d1):
+        if np.sum(zero_flatten[i:, :]) == 0:
+            break
+    d1_bound = i
+
+    d2_bound = 0
+    for i in range(0, d2):
+        if np.sum(zero_flatten[:, i:]) == 0:
+            break
+    d2_bound = i
+
+    return d1_bound,  d2_bound
 
 class TransformerEncoderLayer(nn.Module):
     """Encoder layer block.
@@ -28,14 +68,37 @@ class TransformerEncoderLayer(nn.Module):
         args (argparse.Namespace): parsed command-line arguments
     """
 
-    def __init__(self, args):
+    def __init__(self, args, self_attn_pattern = None):
         super().__init__()
+        if args.PRUNE_ENC_SELF_ATTN and self_attn_pattern is not None:
+            cpu_np_pattern = self_attn_pattern.cpu().numpy()
+            d1_bounds, d2_bounds = find_bounds(cpu_np_pattern)
+            prune_random = False
+            try:
+                if args.RANDOM_PRUNE: #random prune
+                    prune_random = True
+                    self.self_attn_mask = torch.from_numpy(random_mask(cpu_np_pattern, args.TAU))
+                    if args.CUDA:
+                         self.self_attn_mask = self.self_attn_mask.cuda()
+            except:
+                pass
+
+            if not prune_random:
+                cpu_np_pattern = self_attn_pattern.cpu().numpy()
+                d1_bounds, d2_bounds = find_bounds(cpu_np_pattern)
+                cpu_np_pattern = cpu_np_pattern[:,:,0:d1_bounds, 0:d2_bounds]
+                target_percentile = args.TAU * 100
+                threshold = np.percentile(cpu_np_pattern, target_percentile, interpolation='nearest')
+                self.self_attn_mask    = (self_attn_pattern <= threshold)
+        else:
+            self.self_attn_mask = None
         self.embed_dim = args.encoder_embed_dim
         self.self_attn = MultiheadAttention(
             self.embed_dim,
             args.encoder_attention_heads,
             dropout=args.attention_dropout,
             self_attention=True,
+            args=args,
         )
         self.self_attn_layer_norm = LayerNorm(self.embed_dim)
         self.dropout = args.dropout
@@ -99,6 +162,7 @@ class TransformerEncoderLayer(nn.Module):
             value=x,
             key_padding_mask=encoder_padding_mask,
             attn_mask=attn_mask,
+            prune_attn_mask = self.self_attn_mask,
         )
         x = F.dropout(x, p=self.dropout, training=self.training)
         x = residual + x
@@ -136,9 +200,49 @@ class TransformerDecoderLayer(nn.Module):
     """
 
     def __init__(
-        self, args, no_encoder_attn=False, add_bias_kv=False, add_zero_attn=False
+        self, args, self_attn_pattern = None, encoder_attn_pattern = None, no_encoder_attn=False, add_bias_kv=False, add_zero_attn=False
     ):
         super().__init__()
+        if self_attn_pattern is not None and args.PRUNE_DEC_SELF_ATTN:
+            cpu_np_pattern = self_attn_pattern.cpu().numpy()
+            d1_bounds, d2_bounds = find_bounds(cpu_np_pattern)
+            prune_random = False
+            try:
+                if args.RANDOM_PRUNE: #random prune
+                    prune_random = True
+                    self.self_attn_mask = torch.from_numpy(random_mask(cpu_np_pattern, args.TAU))
+                    if args.CUDA:
+                        self.self_attn_mask = self.self_attn_mask.cuda()
+            except:
+                pass
+            if not prune_random:
+                cpu_np_pattern = cpu_np_pattern[:,:,0:d1_bounds, 0:d2_bounds]
+                target_percentile = args.TAU * 100
+                threshold = np.percentile(cpu_np_pattern, target_percentile, interpolation='nearest')
+                self.self_attn_mask    = (self_attn_pattern <= threshold)
+        else:
+            self.self_attn_mask = None
+
+        if encoder_attn_pattern is not None and args.PRUNE_ENC_DEC_ATTN:
+            cpu_np_pattern = encoder_attn_pattern.cpu().numpy()
+            d1_bounds, d2_bounds = find_bounds(cpu_np_pattern)
+            prune_random = False
+            try:
+                if args.RANDOM_PRUNE: #random prune
+                    prune_random = True
+                    self.encoder_attn_mask = torch.from_numpy(random_mask(cpu_np_pattern, args.TAU))
+                    if args.CUDA:
+                         self.encoder_attn_mask = self.encoder_attn_mask.cuda()
+            except:
+                pass
+            if not prune_random:
+                cpu_np_pattern = cpu_np_pattern[:,:,0:d1_bounds, 0:d2_bounds]
+                target_percentile = args.TAU * 100
+                threshold = np.percentile(cpu_np_pattern, target_percentile, interpolation='nearest')
+                self.encoder_attn_mask    = (encoder_attn_pattern <= threshold)
+        else:
+            self.encoder_attn_mask = None
+
         self.embed_dim = args.decoder_embed_dim
         self.cross_self_attention = getattr(args, "cross_self_attention", False)
         self.self_attn = MultiheadAttention(
@@ -148,6 +252,7 @@ class TransformerDecoderLayer(nn.Module):
             add_bias_kv=add_bias_kv,
             add_zero_attn=add_zero_attn,
             self_attention=not self.cross_self_attention,
+            args=args,
         )
         self.dropout = args.dropout
         self.activation_fn = utils.get_activation_fn(
@@ -176,6 +281,7 @@ class TransformerDecoderLayer(nn.Module):
                 vdim=getattr(args, "encoder_embed_dim", None),
                 dropout=args.attention_dropout,
                 encoder_decoder_attention=True,
+                args=args,
             )
             self.encoder_attn_layer_norm = LayerNorm(self.embed_dim, export=export)
 
@@ -265,6 +371,7 @@ class TransformerDecoderLayer(nn.Module):
             incremental_state=incremental_state,
             need_weights=False,
             attn_mask=self_attn_mask,
+            prune_attn_mask = self.self_attn_mask,
         )
         x = F.dropout(x, p=self.dropout, training=self.training)
         x = residual + x
@@ -295,6 +402,7 @@ class TransformerDecoderLayer(nn.Module):
                 static_kv=True,
                 need_weights=need_attn or (not self.training and self.need_attn),
                 need_head_weights=need_head_weights,
+                prune_attn_mask = self.encoder_attn_mask
             )
             x = F.dropout(x, p=self.dropout, training=self.training)
             x = residual + x

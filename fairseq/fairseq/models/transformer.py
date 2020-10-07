@@ -28,10 +28,11 @@ from fairseq.modules import (
 )
 from torch import Tensor
 
+import numpy as np
+
 
 DEFAULT_MAX_SOURCE_POSITIONS = 1024
 DEFAULT_MAX_TARGET_POSITIONS = 1024
-
 
 @register_model("transformer")
 class TransformerModel(FairseqEncoderDecoderModel):
@@ -370,6 +371,26 @@ class TransformerEncoder(FairseqEncoder):
         super().__init__(dictionary)
         self.register_buffer("version", torch.Tensor([3]))
 
+        try:
+            if args.PRUNE_BOOL:
+                self.encoder_self_attn_path = args.ENCODER_SELF_ATTN_PATH
+                self.encoder_self_attn_pattern = torch.from_numpy(np.load(self.encoder_self_attn_path)) #(no_layers, 1, no_head, 1024, 1024)
+                if args.CUDA:
+                     self.encoder_self_attn_pattern = self.encoder_self_attn_pattern.cuda()
+        except: #backward compatibility
+            args.PRUNE_BOOL = False
+            args.PRUNE_ENC_SELF_ATTN = False
+            args.PRUNE_DEC_SELF_ATTN = False
+            args.PRUNE_ENC_DEC_ATTN = False
+            args.TAU = 0
+            args.USE_ENTMAX = False
+            args.ENCODER_SELF_ATTN_PATH = None
+            args.DECODER_SELF_ATTN_PATH = None
+            args.ENCODER_DECODER_ATTN_PATH = None
+            args.CUDA = True
+            args.RANDOM_PRUNE = False
+
+
         self.dropout = args.dropout
         self.encoder_layerdrop = args.encoder_layerdrop
 
@@ -395,9 +416,14 @@ class TransformerEncoder(FairseqEncoder):
         self.layer_wise_attention = getattr(args, "layer_wise_attention", False)
 
         self.layers = nn.ModuleList([])
-        self.layers.extend(
-            [TransformerEncoderLayer(args) for i in range(args.encoder_layers)]
-        )
+        if args.PRUNE_BOOL:
+            self.layers.extend(
+                [TransformerEncoderLayer(args, self.encoder_self_attn_pattern[i]) for i in range(args.encoder_layers)]
+            )
+        else:
+            self.layers.extend(
+                [TransformerEncoderLayer(args, None) for i in range(args.encoder_layers)]
+            )
         self.num_layers = len(self.layers)
 
         if args.encoder_normalize_before:
@@ -589,6 +615,15 @@ class TransformerDecoder(FairseqIncrementalDecoder):
         self.register_buffer("version", torch.Tensor([3]))
         self._future_mask = torch.empty(0)
 
+        if args.PRUNE_BOOL:
+            self.decoder_self_attn_path    = args.DECODER_SELF_ATTN_PATH
+            self.encoder_decoder_attn_path = args.ENCODER_DECODER_ATTN_PATH
+            self.decoder_self_attn_pattern = torch.from_numpy(np.load(self.decoder_self_attn_path)) #(no_layers, 1, no_head, 1024, 1024)
+            self.encoder_decoder_attn_pattern = torch.from_numpy(np.load(self.encoder_decoder_attn_path)) #(no_layers, 1, no_head, 1024, 1024)
+            if args.CUDA:
+                self.decoder_self_attn_pattern = self.decoder_self_attn_pattern.cuda()
+                self.encoder_decoder_attn_pattern = self.encoder_decoder_attn_pattern.cuda()
+
         self.dropout = args.dropout
         self.decoder_layerdrop = args.decoder_layerdrop
         self.share_input_output_embed = args.share_decoder_input_output_embed
@@ -626,12 +661,21 @@ class TransformerDecoder(FairseqIncrementalDecoder):
         self.layer_wise_attention = getattr(args, "layer_wise_attention", False)
 
         self.layers = nn.ModuleList([])
-        self.layers.extend(
-            [
-                TransformerDecoderLayer(args, no_encoder_attn)
-                for _ in range(args.decoder_layers)
-            ]
-        )
+        if args.PRUNE_BOOL:
+            self.layers.extend(
+                [
+                    TransformerDecoderLayer(args, self.decoder_self_attn_pattern[i], self.encoder_decoder_attn_pattern[i], no_encoder_attn)
+                    for i in range(args.decoder_layers)
+                ]
+            )
+        else:
+            self.layers.extend(
+                [
+                    TransformerDecoderLayer(args, None, None, no_encoder_attn)
+                    for i in range(args.decoder_layers)
+                ]
+            )
+
         self.num_layers = len(self.layers)
 
         self.adaptive_softmax = None

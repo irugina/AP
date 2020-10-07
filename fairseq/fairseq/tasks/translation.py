@@ -197,6 +197,20 @@ class TranslationTask(FairseqTask):
         parser.add_argument('--eval-bleu-print-samples', action='store_true',
                             help='print sample generations during validation')
         # fmt: on
+        parser.add_argument('--PRUNE_BOOL', action='store_true')
+        parser.add_argument('--PRUNE_ENC_SELF_ATTN', action='store_true')
+        parser.add_argument('--PRUNE_DEC_SELF_ATTN', action='store_true')
+        parser.add_argument('--PRUNE_ENC_DEC_ATTN', action='store_true')
+        parser.add_argument('--TAU', type=float, default=0)
+
+        parser.add_argument('--USE_ENTMAX', action='store_true')
+
+        parser.add_argument('--ENCODER_SELF_ATTN_PATH', type=str)
+        parser.add_argument('--DECODER_SELF_ATTN_PATH', type=str)
+        parser.add_argument('--ENCODER_DECODER_ATTN_PATH', type=str)
+
+        parser.add_argument('--CUDA', action='store_true')
+        parser.add_argument('--RANDOM_PRUNE', action='store_true')
 
     def __init__(self, args, src_dict, tgt_dict):
         super().__init__(args)
@@ -367,5 +381,7 @@ class TranslationTask(FairseqTask):
         if self.args.eval_bleu_print_samples:
             logger.info('example hypothesis: ' + hyps[0])
             logger.info('example reference: ' + refs[0])
-        tokenize = sacrebleu.DEFAULT_TOKENIZER if not self.args.eval_tokenized_bleu else 'none'
-        return sacrebleu.corpus_bleu(hyps, [refs], tokenize=tokenize)
+        if self.args.eval_tokenized_bleu:
+            return sacrebleu.corpus_bleu(hyps, [refs], tokenize='none')
+        else:
+            return sacrebleu.corpus_bleu(hyps, [refs])
