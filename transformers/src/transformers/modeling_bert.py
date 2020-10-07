@@ -212,6 +212,7 @@ class BertSelfAttention(nn.Module):
         head_mask=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
+        prune_mask=None
     ):
         mixed_query_layer = self.query(hidden_states)
 
@@ -238,6 +239,12 @@ class BertSelfAttention(nn.Module):
             attention_scores = attention_scores + attention_mask
 
         # Normalize the attention scores to probabilities.
+
+        # use prune_mask before softmax!
+        if prune_mask is not None:
+            assert attention_scores.shape == prune_mask.shape
+            attention_scores += (-1e9 * prune_mask).to(torch.float)
+
         attention_probs = nn.Softmax(dim=-1)(attention_scores)
 
         # This is actually dropping out entire tokens to attend to, which might
@@ -309,9 +316,10 @@ class BertAttention(nn.Module):
         head_mask=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
+        prune_mask=None
     ):
         self_outputs = self.self(
-            hidden_states, attention_mask, head_mask, encoder_hidden_states, encoder_attention_mask
+            hidden_states, attention_mask, head_mask, encoder_hidden_states, encoder_attention_mask, prune_mask=prune_mask
         )
         attention_output = self.output(self_outputs[0], hidden_states)
         outputs = (attention_output,) + self_outputs[1:]  # add attentions if we output them
@@ -364,8 +372,9 @@ class BertLayer(nn.Module):
         head_mask=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
+        prune_mask=None
     ):
-        self_attention_outputs = self.attention(hidden_states, attention_mask, head_mask)
+        self_attention_outputs = self.attention(hidden_states, attention_mask, head_mask, prune_mask=prune_mask)
         attention_output = self_attention_outputs[0]
         outputs = self_attention_outputs[1:]  # add self attentions if we output attention weights
 
@@ -396,6 +405,7 @@ class BertEncoder(nn.Module):
         head_mask=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
+        prune_mask=None
     ):
         all_hidden_states = ()
         all_attentions = ()
@@ -404,7 +414,7 @@ class BertEncoder(nn.Module):
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
             layer_outputs = layer_module(
-                hidden_states, attention_mask, head_mask[i], encoder_hidden_states, encoder_attention_mask
+                hidden_states, attention_mask, head_mask[i], encoder_hidden_states, encoder_attention_mask, prune_mask=prune_mask[i]
             )
             hidden_states = layer_outputs[0]
 
@@ -643,6 +653,7 @@ class BertModel(BertPreTrainedModel):
         inputs_embeds=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
+        prune_mask=None
     ):
         r"""
     Return:
@@ -779,6 +790,15 @@ class BertModel(BertPreTrainedModel):
         else:
             head_mask = [None] * self.config.num_hidden_layers
 
+        # Prepare prune mask if needed
+        # 1.0 in prune_mask indicate we prune the entry
+        # input prune_mask has shape [num_hidden_layers x 1 x num_heads x seq_length x seq_length]
+        # and prune_mask is converted to shape [num_hidden_layers x batch x num_heads x seq_length x seq_length]
+        if prune_mask is not None:
+            reshaped_prune_mask = prune_mask.repeat(1, input_ids.shape[0] , 1, 1, 1)
+        else:
+            reshaped_prune_mask = [None] * self.config.num_hidden_layers
+
         embedding_output = self.embeddings(
             input_ids=input_ids, position_ids=position_ids, token_type_ids=token_type_ids, inputs_embeds=inputs_embeds
         )
@@ -788,6 +808,7 @@ class BertModel(BertPreTrainedModel):
             head_mask=head_mask,
             encoder_hidden_states=encoder_hidden_states,
             encoder_attention_mask=encoder_extended_attention_mask,
+            prune_mask=reshaped_prune_mask,
         )
         sequence_output = encoder_outputs[0]
         pooled_output = self.pooler(sequence_output)
@@ -1125,6 +1146,7 @@ class BertForSequenceClassification(BertPreTrainedModel):
         head_mask=None,
         inputs_embeds=None,
         labels=None,
+        prune_mask=None
     ):
         r"""
         labels (:obj:`torch.LongTensor` of shape :obj:`(batch_size,)`, `optional`, defaults to :obj:`None`):
@@ -1166,7 +1188,6 @@ class BertForSequenceClassification(BertPreTrainedModel):
         loss, logits = outputs[:2]
 
         """
-
         outputs = self.bert(
             input_ids,
             attention_mask=attention_mask,
@@ -1174,6 +1195,7 @@ class BertForSequenceClassification(BertPreTrainedModel):
             position_ids=position_ids,
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
+            prune_mask=prune_mask
         )
 
         pooled_output = outputs[1]
