@@ -66,3 +66,16 @@ We add a ```compute_attn_score.py``` script to gather average attention patterns
 <li>CUDA - flag to use CUDA training  </li>
 <li>RANDOM_PRUNE - flag for random pruning experiments  </li>
 </ul>
+
+## Transformers - BERT
+
+First of all, make sure to run this in an environment where the transformers library is not installed. 
+
+Run ```src/run_glue.py``` to either collect attention patterns or train sparse models. We added four additionl arguments: 
+
+<ul>
+<li>save_attention_patterns - flag to Save Attention Pattern To Disk</li>
+<li>prune - flag to use sparse attention mechanisms</li>
+<li>attn_path - path to attention patterns when either using sparse attention mechanisms or saving these patterns to disk</li>
+<li>tau - prune percentage </li>
+</ul>
