@@ -2,6 +2,9 @@
 
 Code for the paper "Data-Informed Global Sparseness in Attention Mechanisms for Deep Neural Networks"
 
+![Performance](./ap_figure.pdf)
+
+
 Initial codebases:
 
 <ul>
@@ -13,12 +16,53 @@ Initial codebases:
 
 ## Transformer-XL
 
-We only experiment with pruning wikitext-103 base architecture. To replicate our results with either this or other datasets, you might need to modify some or all of:
+We only experiment with pruning wikitext-103 base architecture. 
 
+### Gathering average attention patterns
+
+We add a ```compute_mask.py``` script to gather average attention patterns. To replicate our results you might need to modify some or all of:
 <ul>
 <li>the constants defined in the first few lines of compute_mask.py </li>
 <li>last line of compute_mask which specifies where to save the average attention pattern.</li>
 </ul>	
 
 
-Note that train.py takes an argument ```fn``` to specify path to average attention pattern.
+### Training sparse models
+
+```train.py``` takes two additional arguments:
+
+<ul>
+<li>fn - specify path to average attention pattern </li>
+<li>th - to specify desired sparseness percentage </li>
+</ul>
+
+
+## Fairseq
+
+### Gathering average attention patterns
+
+We add a ```compute_attn_score.py``` script to gather average attention patterns which saves the average attention patterns as numpy arrays in ```avg_attn_probabilities``` folder. Additionally, it takes a few parameters: 
+
+<ul>
+<li> path - path to directory with checkpoint for trained model  </li>
+<li> fn - filename of said checkpoint  </li>
+<li> cuda - true by default, set flag if you want to use cpu  </li>
+<li> attn_type - one of 'self-enc', 'self-dec' or 'enc-dec' to specify what type of average pattern we want to compute  </li>
+<li> dataset_name  </li>
+<li> half - whether the checkpoint used half-precision training or not  </li>
+<li> use_entmax - whether the checkpoint used entmax or not (default is softmax)  </li>
+<li> using_old_model - whether we're using a pre-trained fairseq model  </li>
+</ul>
+
+### Training sparse models
+
+```train.py``` takes some additional arguments:
+
+<ul>
+<li>PRUNE_BOOL, PRUNE_ENC_SELF_ATTN, PRUNE_DEC_SELF_ATTN, PRUNE_ENC_DEC_ATTN - flags to specify if we want to use sparse attention, and if so, what type(s) </li>
+<li>TAU - desired sparseness percentage </li>
+<li>USE_ENTMAX - flag to specify if we want to use entmax or not (default is softmax) </li>
+<li>ENCODER_SELF_ATTN_PATH, DECODER_SELF_ATTN_PATH, ENCODER_DECODER_ATTN_PATH - path(s) to average attention pattern(s) if necessarily  </li>
+<li>CUDA - flag to use CUDA training  </li>
+<li>RANDOM_PRUNE - flag for random pruning experiments  </li>
+</ul>
