@@ -20,6 +20,7 @@ import logging
 import math
 import os
 
+import numpy as np
 import torch
 from torch import nn
 from torch.nn import CrossEntropyLoss, MSELoss
@@ -29,6 +30,7 @@ from .configuration_bert import BertConfig
 from .file_utils import add_start_docstrings, add_start_docstrings_to_callable
 from .modeling_utils import PreTrainedModel, prune_linear_layer
 
+from deepspeed.ops.sparse_attention import SparseSelfAttention, SparsityConfig
 
 logger = logging.getLogger(__name__)
 
@@ -181,7 +183,7 @@ class BertEmbeddings(nn.Module):
 
 
 class BertSelfAttention(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, sparsity_config=None):
         super().__init__()
         if config.hidden_size % config.num_attention_heads != 0 and not hasattr(config, "embedding_size"):
             raise ValueError(
@@ -200,6 +202,11 @@ class BertSelfAttention(nn.Module):
 
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
 
+        self.sparse = False
+        if sparsity_config is not None:
+            self.sparse_self_attention = SparseSelfAttention(sparsity_config)
+            self.sparse = True
+
     def transpose_for_scores(self, x):
         new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
         x = x.view(*new_x_shape)
@@ -212,6 +219,7 @@ class BertSelfAttention(nn.Module):
         head_mask=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
+        prune_mask=None
     ):
         mixed_query_layer = self.query(hidden_states)
 
@@ -230,25 +238,29 @@ class BertSelfAttention(nn.Module):
         key_layer = self.transpose_for_scores(mixed_key_layer)
         value_layer = self.transpose_for_scores(mixed_value_layer)
 
-        # Take the dot product between "query" and "key" to get the raw attention scores.
-        attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
-        attention_scores = attention_scores / math.sqrt(self.attention_head_size)
-        if attention_mask is not None:
-            # Apply the attention mask is (precomputed for all layers in BertModel forward() function)
-            attention_scores = attention_scores + attention_mask
+        if not self.sparse:
+            # Take the dot product between "query" and "key" to get the raw attention scores.
+            attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
+            attention_scores = attention_scores / math.sqrt(self.attention_head_size)
+            if attention_mask is not None:
+                # Apply the attention mask is (precomputed for all layers in BertModel forward() function)
+                attention_scores = attention_scores + attention_mask
+            # Normalize the attention scores to probabilities.
+            # use prune_mask before softmax!
+            if prune_mask is not None:
+                assert attention_scores.shape == prune_mask.shape
+                attention_scores += (-1e9 * prune_mask).to(torch.float)
+            attention_probs = nn.Softmax(dim=-1)(attention_scores)
+            # This is actually dropping out entire tokens to attend to, which might
+            # seem a bit unusual, but is taken from the original Transformer paper.
+            attention_probs = self.dropout(attention_probs)
+            # Mask heads if we want to
+            if head_mask is not None:
+                attention_probs = attention_probs * head_mask
+            context_layer = torch.matmul(attention_probs, value_layer)
 
-        # Normalize the attention scores to probabilities.
-        attention_probs = nn.Softmax(dim=-1)(attention_scores)
-
-        # This is actually dropping out entire tokens to attend to, which might
-        # seem a bit unusual, but is taken from the original Transformer paper.
-        attention_probs = self.dropout(attention_probs)
-
-        # Mask heads if we want to
-        if head_mask is not None:
-            attention_probs = attention_probs * head_mask
-
-        context_layer = torch.matmul(attention_probs, value_layer)
+        if self.sparse: #TODO might need to transpose key_layer as above
+            context_layer = self.sparse_self_attention(query_layer, key_layer, value_layer, key_padding_mask=attention_mask)
 
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
         new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
@@ -309,9 +321,10 @@ class BertAttention(nn.Module):
         head_mask=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
+        prune_mask=None
     ):
         self_outputs = self.self(
-            hidden_states, attention_mask, head_mask, encoder_hidden_states, encoder_attention_mask
+            hidden_states, attention_mask, head_mask, encoder_hidden_states, encoder_attention_mask, prune_mask=prune_mask
         )
         attention_output = self.output(self_outputs[0], hidden_states)
         outputs = (attention_output,) + self_outputs[1:]  # add attentions if we output them
@@ -364,8 +377,9 @@ class BertLayer(nn.Module):
         head_mask=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
+        prune_mask=None
     ):
-        self_attention_outputs = self.attention(hidden_states, attention_mask, head_mask)
+        self_attention_outputs = self.attention(hidden_states, attention_mask, head_mask, prune_mask=prune_mask)
         attention_output = self_attention_outputs[0]
         outputs = self_attention_outputs[1:]  # add self attentions if we output attention weights
 
@@ -383,11 +397,19 @@ class BertLayer(nn.Module):
 
 
 class BertEncoder(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, sparse_attention_config = None):
         super().__init__()
         self.output_attentions = config.output_attentions
         self.output_hidden_states = config.output_hidden_states
-        self.layer = nn.ModuleList([BertLayer(config) for _ in range(config.num_hidden_layers)])
+
+        layers = []
+        for layer_idx in range(config.num_hidden_layers):
+            layer = BertLayer(config)
+            if sparse_attention_config is not None:
+                #TODO in our case sparseness isn't the same accross layers so i'll need to figure this out better
+                layer.attention.self = BertSelfAttention(config, sparsity_config=sparse_attention_config[layer_idx])
+            layers.append(layer)
+        self.layer = nn.ModuleList(layers)
 
     def forward(
         self,
@@ -396,6 +418,7 @@ class BertEncoder(nn.Module):
         head_mask=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
+        prune_mask=None
     ):
         all_hidden_states = ()
         all_attentions = ()
@@ -404,7 +427,7 @@ class BertEncoder(nn.Module):
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
             layer_outputs = layer_module(
-                hidden_states, attention_mask, head_mask[i], encoder_hidden_states, encoder_attention_mask
+                hidden_states, attention_mask, head_mask[i], encoder_hidden_states, encoder_attention_mask, prune_mask=prune_mask[i]
             )
             hidden_states = layer_outputs[0]
 
@@ -591,6 +614,50 @@ BERT_INPUTS_DOCSTRING = r"""
     "The bare Bert Model transformer outputting raw hidden-states without any specific head on top.",
     BERT_START_DOCSTRING,
 )
+
+class OurSparsityConfig(SparsityConfig):
+    def __init__(self, num_heads, block, args, layer_idx):
+        different_layout_per_head = True
+        super().__init__(num_heads, block, different_layout_per_head)
+
+        #(n_layers, 1, n_head, block_w, block_h)
+        self.block_mask = torch.tensor(np.load(args.block_mask_path), dtype=torch.int64)
+        self.block_w, self.block_h = self.block_mask.shape[-2:]
+
+        self.layer_idx = layer_idx
+
+    def make_layout(self, seq_len):
+        #(num_heads, num_blocks, num_blocks) all zeros, degenerate pattern with no connection
+        #note: num_blocks >> block_h, block_w
+        layout = self.setup_layout(seq_len)
+
+        #set some of the connections on using block_mask
+        layout[:, 0:self.block_w, 0:self.block_w] = self.block_mask[self.layer_idx, 0, :,:,:]
+
+        return layout
+
+def get_sparse_attention_utils(sparse_attention_config):
+    if sparse_attention_config is not None:
+        from deepspeed.ops.sparse_attention import SparseAttentionUtils
+        return SparseAttentionUtils
+    return None
+
+
+def get_sparse_attention_config(args, num_heads, num_layers):
+    '''
+    note:
+      - when employing sparseness this used to return a class inheriting from SparsityConfig
+      - now in returns a list of such objects - one for each transformer layer
+    '''
+    if args.sparse:
+        if args.dense_sparsity:
+            from deepspeed.ops.sparse_attention import DenseSparsityConfig
+            return [DenseSparsityConfig(num_heads=num_heads) for _ in range(num_layers)]
+        if args.ap_sparsity:
+            return [OurSparsityConfig(num_heads, args.block_size, args, layer_idx) for layer_idx in range(num_layers)]
+    else:
+        return None
+
 class BertModel(BertPreTrainedModel):
     """
 
@@ -608,14 +675,22 @@ class BertModel(BertPreTrainedModel):
 
     """
 
-    def __init__(self, config):
+    def __init__(self, config, args=None):
         super().__init__(config)
         self.config = config
-
         self.embeddings = BertEmbeddings(config)
-        self.encoder = BertEncoder(config)
-        self.pooler = BertPooler(config)
 
+        if args is not None and args.sparse:
+	    # set pad_token_id that is used for sparse attention padding
+            self.pad_token_id = config.pad_token_id if hasattr(
+                config, 'pad_token_id') and config.pad_token_id is not None else 0
+            # set sparse_attention_config if it has been selected
+            self.sparse_attention_config = get_sparse_attention_config(args, config.num_attention_heads, config.num_hidden_layers)
+            self.sparse_attention_utils = get_sparse_attention_utils(self.sparse_attention_config)
+        else:
+            self.sparse_attention_config=None
+        self.encoder = BertEncoder(config, self.sparse_attention_config)
+        self.pooler = BertPooler(config)
         self.init_weights()
 
     def get_input_embeddings(self):
@@ -643,6 +718,7 @@ class BertModel(BertPreTrainedModel):
         inputs_embeds=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
+        prune_mask=None
     ):
         r"""
     Return:
@@ -734,6 +810,17 @@ class BertModel(BertPreTrainedModel):
         extended_attention_mask = extended_attention_mask.to(dtype=next(self.parameters()).dtype)  # fp16 compatibility
         extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
 
+        if self.sparse_attention_config is not None:
+            pad_len, input_ids, attention_mask, token_type_ids, position_ids, inputs_embeds = self.sparse_attention_utils.pad_to_block_size(
+            block_size=self.sparse_attention_config[0].block,
+                input_ids=input_ids,
+                attention_mask=extended_attention_mask,
+                token_type_ids=token_type_ids,
+                position_ids=None,
+                inputs_embeds=None,
+                pad_token_id=self.pad_token_id,
+                model_mbeddings=self.embeddings)
+
         # If a 2D ou 3D attention mask is provided for the cross-attention
         # we need to make broadcastabe to [batch_size, num_heads, seq_length, seq_length]
         if self.config.is_decoder and encoder_hidden_states is not None:
@@ -779,6 +866,15 @@ class BertModel(BertPreTrainedModel):
         else:
             head_mask = [None] * self.config.num_hidden_layers
 
+        # Prepare prune mask if needed
+        # 1.0 in prune_mask indicate we prune the entry
+        # input prune_mask has shape [num_hidden_layers x 1 x num_heads x seq_length x seq_length]
+        # and prune_mask is converted to shape [num_hidden_layers x batch x num_heads x seq_length x seq_length]
+        if prune_mask is not None:
+            reshaped_prune_mask = prune_mask.repeat(1, input_ids.shape[0] , 1, 1, 1)
+        else:
+            reshaped_prune_mask = [None] * self.config.num_hidden_layers
+
         embedding_output = self.embeddings(
             input_ids=input_ids, position_ids=position_ids, token_type_ids=token_type_ids, inputs_embeds=inputs_embeds
         )
@@ -788,9 +884,14 @@ class BertModel(BertPreTrainedModel):
             head_mask=head_mask,
             encoder_hidden_states=encoder_hidden_states,
             encoder_attention_mask=encoder_extended_attention_mask,
+            prune_mask=reshaped_prune_mask,
         )
         sequence_output = encoder_outputs[0]
         pooled_output = self.pooler(sequence_output)
+
+        if self.sparse_attention_config is not None and pad_len > 0:
+            encoded_layers[-1] = SparseAttentionUtils.unpad_sequence_output(
+                pad_len, encoded_layers[-1])
 
         outputs = (sequence_output, pooled_output,) + encoder_outputs[
             1:
@@ -1125,6 +1226,7 @@ class BertForSequenceClassification(BertPreTrainedModel):
         head_mask=None,
         inputs_embeds=None,
         labels=None,
+        prune_mask=None
     ):
         r"""
         labels (:obj:`torch.LongTensor` of shape :obj:`(batch_size,)`, `optional`, defaults to :obj:`None`):
@@ -1166,7 +1268,6 @@ class BertForSequenceClassification(BertPreTrainedModel):
         loss, logits = outputs[:2]
 
         """
-
         outputs = self.bert(
             input_ids,
             attention_mask=attention_mask,
@@ -1174,6 +1275,7 @@ class BertForSequenceClassification(BertPreTrainedModel):
             position_ids=position_ids,
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
+            prune_mask=prune_mask
         )
 
         pooled_output = outputs[1]

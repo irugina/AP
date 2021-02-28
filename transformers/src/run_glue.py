@@ -180,6 +180,13 @@ def train(args, train_dataset, model, tokenizer):
     logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
     logger.info("  Total optimization steps = %d", t_total)
 
+    if args.prune:
+        prune_mask = np.load(args.attn_path)
+        prune_mask = 1 - np.array(prune_mask) #after this line 1 will indicate I want to remove that connection
+        prune_mask = torch.from_numpy(prune_mask).to(args.device)
+    else:
+        prune_mask = None
+
     global_step = 0
     epochs_trained = 0
     steps_trained_in_current_epoch = 0
@@ -215,13 +222,19 @@ def train(args, train_dataset, model, tokenizer):
 
             model.train()
             batch = tuple(t.to(args.device) for t in batch)
-            inputs = {"input_ids": batch[0], "attention_mask": batch[1], "labels": batch[3]}
+            inputs = {"input_ids": batch[0], "attention_mask": batch[1], "labels": batch[3], "prune_mask": prune_mask}
             if args.model_type != "distilbert":
                 inputs["token_type_ids"] = (
                     batch[2] if args.model_type in ["bert", "xlnet", "albert"] else None
                 )  # XLM, DistilBERT, RoBERTa, and XLM-RoBERTa don't use segment_ids
             outputs = model(**inputs)
-            loss = outputs[0]  # model outputs are always tuple in transformers (see doc)
+
+            #taken from run_bertology script
+            loss, logits, all_attentions = (
+                outputs[0],
+                outputs[1],
+                outputs[-1],
+            )
 
             if args.n_gpu > 1:
                 loss = loss.mean()  # mean() to average on multi-gpu parallel training
@@ -300,6 +313,44 @@ def train(args, train_dataset, model, tokenizer):
 
     return global_step, tr_loss / global_step
 
+def gather_attn_patterns(args, train_dataset, model, tokenizer, prefix=""):
+    train_sampler = RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
+    train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
+    epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
+    num_hidden_layers = len(model.bert.encoder.layer)
+    assert args.n_gpu == 1
+    for step, batch in enumerate(epoch_iterator):
+
+        model.eval()
+        batch = tuple(t.to(args.device) for t in batch)
+
+        with torch.no_grad():
+            inputs = {"input_ids": batch[0], "attention_mask": batch[1], "labels": batch[3]}
+            if args.model_type != "distilbert":
+                inputs["token_type_ids"] = (
+                    batch[2] if args.model_type in ["bert", "xlnet", "albert"] else None
+                )  # XLM, DistilBERT, RoBERTa, and XLM-RoBERTa don't use segment_ids
+            outputs = model(**inputs)
+
+            #--------------------------------------------------------------------------------------------------------------------------------
+            # this is attention pruning stuff
+            all_attentions = outputs[-1]
+            average_attention_patterns = [None for _ in range(0, num_hidden_layers)]
+            # all_attentions is a tuple of {num_hidden_layers} tensors
+            # each of them has shape (batch size, num_attention_heads, max_seq_length, max_seq_length)
+            assert num_hidden_layers == len(all_attentions) #sanity check
+
+            for layer_idx in range(0, num_hidden_layers): #for each hidden layer
+                avg_attention_for_batch = all_attentions[layer_idx].mean(dim = 0,  keepdim=True)
+                if average_attention_patterns[layer_idx] is None: #if this is first batch, bootstrap averaging over batch
+                    average_attention_patterns[layer_idx] = avg_attention_for_batch
+                else: #rolling average
+                    p1 = counter / (counter + 1) #percentage to give to average_attention_patterns[layer_idx]
+                    p2 =       1 / (counter + 1) #percentage to give to avg_attention_for_batch
+                    average_attention_patterns[layer_idx]  = average_attention_patterns[layer_idx] * p1 + avg_attention_for_batch * p2
+            #--------------------------------------------------------------------------------------------------------------------------------
+
+    return average_attention_patterns
 
 def evaluate(args, model, tokenizer, prefix=""):
     # Loop to handle MNLI double evaluation (matched, mis-matched)
@@ -330,19 +381,27 @@ def evaluate(args, model, tokenizer, prefix=""):
         nb_eval_steps = 0
         preds = None
         out_label_ids = None
+
+       if args.prune:
+            prune_mask = np.load(args.attn_path)
+            prune_mask = 1 - np.array(prune_mask) #after this line 1 will indicate I want to remove that connection
+            prune_mask = torch.from_numpy(prune_mask).to(args.device)
+        else:
+            prune_mask = None
+
+        t1 = time.time()
         for batch in tqdm(eval_dataloader, desc="Evaluating"):
             model.eval()
             batch = tuple(t.to(args.device) for t in batch)
 
             with torch.no_grad():
-                inputs = {"input_ids": batch[0], "attention_mask": batch[1], "labels": batch[3]}
+                inputs = {"input_ids": batch[0], "attention_mask": batch[1], "labels": batch[3], "prune_mask": prune_mask}
                 if args.model_type != "distilbert":
                     inputs["token_type_ids"] = (
                         batch[2] if args.model_type in ["bert", "xlnet", "albert"] else None
                     )  # XLM, DistilBERT, RoBERTa, and XLM-RoBERTa don't use segment_ids
                 outputs = model(**inputs)
                 tmp_eval_loss, logits = outputs[:2]
-
                 eval_loss += tmp_eval_loss.mean().item()
             nb_eval_steps += 1
             if preds is None:
@@ -352,6 +411,7 @@ def evaluate(args, model, tokenizer, prefix=""):
                 preds = np.append(preds, logits.detach().cpu().numpy(), axis=0)
                 out_label_ids = np.append(out_label_ids, inputs["labels"].detach().cpu().numpy(), axis=0)
 
+        t2 = time.time()
         eval_loss = eval_loss / nb_eval_steps
         if args.output_mode == "classification":
             preds = np.argmax(preds, axis=1)
@@ -361,11 +421,19 @@ def evaluate(args, model, tokenizer, prefix=""):
         results.update(result)
 
         output_eval_file = os.path.join(eval_output_dir, prefix, "eval_results.txt")
+        write_results = ""
         with open(output_eval_file, "w") as writer:
             logger.info("***** Eval results {} *****".format(prefix))
             for key in sorted(result.keys()):
                 logger.info("  %s = %s", key, str(result[key]))
                 writer.write("%s = %s\n" % (key, str(result[key])))
+                write_results += str(result[key]) + ' '
+        write_results += '\n'
+        with open(f"{args.output_dir}.txt", "a") as file:
+            file.write(write_results)
+
+        print ("time elapsed = {} s".format(t2-t1))
+        print (write_results)
 
     return results
 
@@ -440,6 +508,19 @@ class ModelArguments:
     cache_dir: Optional[str] = field(
         default=None, metadata={"help": "Where do you want to store the pre-trained models downloaded from s3"}
     )
+
+    #--------------------------------------------------------------------------------------------------------------------------------
+    # gather attention mask; prune using masking
+    save_attention_patterns: bool = field(default=False, metadata={"help": "Save Attention Pattern To Disk"})
+    prune: bool = field(default=False, metadata={"help": "Load Attention Pattern from Disk and Prune"})
+    attn_path: str = field(default=None, metadata={"help": "path to attention pattern; to be used for either saving or loading"})
+
+    # sparse kernels
+    sparse: bool = field(default=False, metadata={"help": "Whether to use sparse"})
+    dense_sparsity: bool = field(default=False, metadata={"help": "use full density?"})
+    ap_sparsity: bool = field(default=False, metadata={"help": "use ap method?"})
+    block_size: int = field(default=32)
+    block_mask_path: str = field(default=None)
 
 
 @dataclass
@@ -527,6 +608,7 @@ def main():
         args.config_name if args.config_name else args.model_name_or_path,
         num_labels=num_labels,
         finetuning_task=args.task_name,
+        output_attentions=not args.sparse,
         cache_dir=args.cache_dir,
     )
     tokenizer = AutoTokenizer.from_pretrained(
@@ -541,6 +623,8 @@ def main():
 
     if args.local_rank == 0:
         torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
+
+    model.bert = BertModel(config, args)
 
     model.to(args.device)
 
@@ -591,10 +675,28 @@ def main():
             prefix = checkpoint.split("/")[-1] if checkpoint.find("checkpoint") != -1 else ""
 
             model = AutoModelForSequenceClassification.from_pretrained(checkpoint)
+            model.bert = BertModel(config, args)
             model.to(args.device)
             result = evaluate(args, model, tokenizer, prefix=prefix)
             result = dict((k + "_{}".format(global_step), v) for k, v in result.items())
             results.update(result)
+
+    # Save attention pattern to disk
+    if args.save_attention_patterns and args.local_rank in [-1, 0]:
+        args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
+        train_dataset = load_and_cache_examples(args, args.task_name, tokenizer, evaluate=False)
+
+        tokenizer = AutoTokenizer.from_pretrained(args.output_dir)
+        checkpoint = args.output_dir
+
+        #global_step = checkpoint.split("-")[-1] if len(checkpoints) > 1 else ""
+        prefix = checkpoint.split("/")[-1] if checkpoint.find("checkpoint") != -1 else ""
+
+        model = AutoModelForSequenceClassification.from_pretrained(checkpoint)
+        model.to(args.device)
+        average_attention_patterns = gather_attn_patterns(args, train_dataset, model, tokenizer, prefix=prefix)
+        average_attention_patterns = np.array([t.detach().cpu().numpy() for t in average_attention_patterns ])
+        np.save(args.attn_path, average_attention_patterns)
 
     return results
 
