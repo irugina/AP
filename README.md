@@ -2,8 +2,7 @@
 
 Code for the paper "Data-Informed Global Sparseness in Attention Mechanisms for Deep Neural Networks"
 
-![Performance](./ap_figure.pdf)
-
+<img src="./ap_figure.pdf" width="600px"></img>
 
 Initial codebases:
 
