@@ -1,6 +1,9 @@
-# AP
+# Attention Pruning
 
-Code for the paper "Data-Informed Global Sparseness in Attention Mechanisms for Deep Neural Networks"
+This paper hosts code for [Data-Informed Global Sparseness in Attention Mechanisms for Deep Neural Networks](https://arxiv.org/abs/2012.02030).
+
+
+## Results
 
 <img src="./ap_figure.png" width="600px"></img>
 
