@@ -2,7 +2,7 @@
 
 Code for the paper "Data-Informed Global Sparseness in Attention Mechanisms for Deep Neural Networks"
 
-<img src="./ap_figure.pdf" width="600px"></img>
+<img src="./ap_figure.png" width="600px"></img>
 
 Initial codebases:
 
