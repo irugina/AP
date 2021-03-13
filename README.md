@@ -1,19 +1,25 @@
 # Attention Pruning
 
-This repo hosts code for [Data-Informed Global Sparseness in Attention Mechanisms for Deep Neural Networks](https://arxiv.org/abs/2012.02030).
+This repo hosts code for [Data-Informed Global Sparseness in Attention Mechanisms for Deep Neural Networks](https://arxiv.org/abs/2012.02030) and borrows starter code from [fairseq](https://github.com/pytorch/fairseq), [huggingface](https://github.com/huggingface/transformers), and [transformer-xl](https://github.com/kimiyoung/transformer-xl).
 
 
 ## Results
 
+
+### Performance
 <img src="./ap_figure.png" width="600px"></img>
 
-Initial codebases:
+See paper for details, comparison with entmax, and ood results.
 
-<ul>
-<li>https://github.com/pytorch/fairseq</li>
-<li>https://github.com/huggingface/transformers</li>
-<li>https://github.com/kimiyoung/transformer-xl</li>
-</ul>
+### Computational Efficiency
+results on the SQuAD question answering task:
+
+
+| Percentage  | Exact/F1 scores | Time(s) | GPU Memory(GB) |
+| ----------- | --------------- | ------- | ---------------|
+| 0           | 81.02/88.63     | 95.41   |6.85            |
+| 90          | 79.62/87.32     | 86.44   |5.00            |
+
 
 
 ## Transformer-XL
